@@ -1,9 +1,0 @@
-from nicegui import ui
-from pydantic import BaseModel
-
-from openai import AsyncClient
-
-client = AsyncClient(api_key='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')
-ui.label('Hello NiceGUI!')
-
-# hello frolm aA
