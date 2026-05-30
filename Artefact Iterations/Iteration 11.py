@@ -1,0 +1,1806 @@
+from nicegui import app, classes, events, ui
+import fitz
+import uuid
+from pydantic import BaseModel 
+from openai import AsyncClient, OpenAI
+from pypdf import PdfReader
+from io import BytesIO
+from typing import Optional
+from typing import Literal
+import pdfplumber
+from openpyxl import Workbook, load_workbook
+import os
+import Levenshtein, re
+import pytesseract
+from pdf2image import convert_from_bytes, convert_from_path
+from typing import Literal
+import asyncio
+import random
+
+PDF_DIR = '/tmp/nicegui_pdfs'
+os.makedirs(PDF_DIR, exist_ok=True)
+app.add_static_files('/pdfs', PDF_DIR)
+
+all_candidates = []  # Global list to store candidate Excel row dictionaries
+
+cv_pdf_path = None
+cover_pdf_path = None
+
+cv_tokens = []
+cover_tokens = []
+
+cv_raw_text = ''
+cover_raw_text = ''
+
+client = AsyncClient(api_key='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')
+input_area = ui.textarea(label='PDF text').classes('w-full') 
+output_area = ui.textarea(label='Extracted text') 
+score_area = ui.markdown('No persona scores yet.').classes('w-full text-white')
+ui.add_head_html('''
+                 <style>
+                 textarea {
+                 color: white !important;
+                 }
+                 </style>
+                 ''')
+
+class CandidateInfo(BaseModel):
+    name: Optional[str] = None
+    bachelor_gpa: Optional[list[str]] = None
+    bachelor_gpa_snippets: Optional[list[str]] = None
+    bachelor_education: Optional[list[str]] = None
+    bachelor_education_snippets: Optional[list[str]] = None
+    master_gpa: Optional[list[str]] = None
+    master_gpa_snippets: Optional[list[str]] = None
+    master_education: Optional[list[str]] = None
+    master_education_snippets: Optional[list[str]] = None
+    exchange_gpa: Optional[list[str]] = None
+    exchange_gpa_snippets: Optional[list[str]] = None
+    exchange_education: Optional[list[str]] = None
+    exchange_education_snippets: Optional[list[str]] = None
+    student_job: Optional[list[str]] = None
+    student_job_snippets: Optional[list[str]] = None
+    extracurricular: Optional[list[str]] = None
+    international_experience: Optional[list[str]] = None
+    nordic_language: Optional[str] = None
+    gender: Optional[str] = None
+    persona: Optional[str] = None
+    persona_reason: Optional[str] = None
+    persona_snippets: Optional[list[str]] = None
+
+system_instructions = """
+You will receive a CV. Classify whether the following are true, and extract the text that relates to it.
+"""
+
+class TechStrategist(BaseModel):
+    # UNIVERSITIES
+    extract_evidence_of_attending_Copenhagen_Business_School: list[str]
+    boolean_classify_evidence_of_attending_Copenhagen_Business_School: bool
+    extract_evidence_of_attending_Aarhus_university: list[str]
+    boolean_classify_evidence_of_attending_Aarhus_university: bool
+    extract_evidence_of_attending_University_of_Copenhagen: list[str]
+    boolean_classify_evidence_of_attending_University_of_Copenhagen: bool
+    extract_evidence_of_affending_Danmarks_Tekniske_Universitet_on_a_tech_management_track: list[str]
+    boolean_classify_evidence_of_affending_Danmarks_Tekniske_Universitet_on_a_tech_management_track: bool
+    extract_evidence_of_attending_Lund_University: list[str]
+    boolean_classify_evidence_of_attending_Lund_University: bool
+
+    # PROGRAMS
+    extract_evidence_of_business_admin_digital_business_cbs: list[str]
+    boolean_classify_business_admin_digital_business_cbs: bool
+    extract_evidence_of_strategy_org_leadership_cbs: list[str]
+    boolean_classify_strategy_org_leadership_cbs: bool
+    extract_evidence_of_innovation_business_dev_cbs: list[str]
+    boolean_classify_innovation_business_dev_cbs: bool
+    extract_evidence_of_economics_ku_au: list[str]
+    boolean_classify_economics_ku_au: bool
+    extract_evidence_of_international_business_cbs_au: list[str]
+    boolean_classify_international_business_cbs_au: bool
+    extract_evidence_of_digital_business_management_au: list[str]
+    boolean_classify_digital_business_management_au: bool
+
+    # SIMILAR PROGRAMS
+    boolean_classify_similar_relevant_program: bool
+
+    # GPA
+    extract_evidence_of_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    grade_point_average: float | None
+
+    # KEYWORDS
+    extract_evidence_of_strategic_problem_solving: list[str]
+    boolean_classify_strategic_problem_solving: bool
+    extract_evidence_of_digital_transformation: list[str]
+    boolean_classify_digital_transformation: bool
+    extract_evidence_of_technology_enabled_business_models: list[str]
+    boolean_classify_technology_enabled_business_models: bool
+    extract_evidence_of_c_level_advisory: list[str]
+    boolean_classify_c_level_advisory: bool
+    extract_evidence_of_operating_model_design: list[str]
+    boolean_classify_operating_model_design: bool
+    extract_evidence_of_business_case_development: list[str]
+    boolean_classify_business_case_development: bool
+    extract_evidence_of_technology_strategy: list[str]
+    boolean_classify_technology_strategy: bool
+
+    def university_score(self) -> int:
+        if any([
+            self.boolean_classify_evidence_of_attending_Copenhagen_Business_School,
+            self.boolean_classify_evidence_of_attending_Aarhus_university,
+            self.boolean_classify_evidence_of_attending_University_of_Copenhagen,
+            self.boolean_classify_evidence_of_affending_Danmarks_Tekniske_Universitet_on_a_tech_management_track,
+            self.boolean_classify_evidence_of_attending_Lund_University,
+        ]):
+            return 5
+
+        return 0
+
+    def gpa_score(self) -> int:
+        if self.grade_point_average is None:
+            return 0
+
+        if self.grade_point_average >= 8.5:
+            return 5
+        elif self.grade_point_average >= 7.5:
+            return 4
+        elif self.grade_point_average >= 6:
+            return 3
+        else:
+            return 1
+
+    def program_score(self) -> int:
+        if any([
+            self.boolean_classify_business_admin_digital_business_cbs,
+            self.boolean_classify_strategy_org_leadership_cbs,
+            self.boolean_classify_innovation_business_dev_cbs,
+            self.boolean_classify_economics_ku_au,
+            self.boolean_classify_international_business_cbs_au,
+            self.boolean_classify_digital_business_management_au,
+        ]):
+            return 5
+        elif self.boolean_classify_similar_relevant_program:
+            return 4
+
+        return 0
+
+    def keyword_score(self) -> int:
+        if any([
+            self.boolean_classify_strategic_problem_solving,
+            self.boolean_classify_digital_transformation,
+            self.boolean_classify_technology_enabled_business_models,
+            self.boolean_classify_c_level_advisory,
+            self.boolean_classify_operating_model_design,
+            self.boolean_classify_business_case_development,
+            self.boolean_classify_technology_strategy,
+        ]):
+            return 5
+
+        return 0
+
+    def final_score(self) -> int:
+        return (
+            self.university_score() +
+            self.gpa_score() +
+            self.program_score() +
+            self.keyword_score()
+        )
+
+class TransformationOrchestratorPMO(BaseModel):
+    # UNIVERSITIES
+    extract_evidence_of_attending_Copenhagen_Business_School: list[str]
+    boolean_classify_evidence_of_attending_Copenhagen_Business_School: bool
+    extract_evidence_of_attending_Aarhus_university: list[str]
+    boolean_classify_evidence_of_attending_Aarhus_university: bool
+    extract_evidence_of_attending_Danmarks_Tekniske_Universitet: list[str]
+    boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet: bool
+    extract_evidence_of_attending_IT_University_of_Copenhagen: list[str]
+    boolean_classify_evidence_of_attending_IT_University_of_Copenhagen: bool
+    extract_evidence_of_attending_Aalborg_University: list[str]
+    boolean_classify_evidence_of_attending_Aalborg_University: bool
+
+    # PROGRAMS
+    extract_evidence_of_digital_business_management_au: list[str]
+    boolean_classify_digital_business_management_au: bool
+    extract_evidence_of_business_administration_and_information_systems_cbs: list[str]
+    boolean_classify_business_administration_and_information_systems_cbs: bool
+    extract_evidence_of_management_of_innovation_and_business_development_cbs: list[str]
+    boolean_classify_management_of_innovation_and_business_development_cbs: bool
+    extract_evidence_of_operations_and_supply_chain_programs: list[str]
+    boolean_classify_operations_and_supply_chain_programs: bool
+    extract_evidence_of_engineering_with_business_specialization_dtu: list[str]
+    boolean_classify_engineering_with_business_specialization_dtu: bool
+
+    # SIMILAR PROGRAMS
+    boolean_classify_similar_relevant_program: bool
+
+    # GPA
+    extract_evidence_of_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    grade_point_average: float | None
+
+    # KEYWORDS
+    extract_evidence_of_program_management: list[str]
+    boolean_classify_program_management: bool
+    extract_evidence_of_execution_and_value_realization: list[str]
+    boolean_classify_execution_and_value_realization: bool
+    extract_evidence_of_governance_and_operating_models: list[str]
+    boolean_classify_governance_and_operating_models: bool
+    extract_evidence_of_change_enablement: list[str]
+    boolean_classify_change_enablement: bool
+    extract_evidence_of_stakeholder_coordination: list[str]
+    boolean_classify_stakeholder_coordination: bool
+    extract_evidence_of_implementation_roadmap_design: list[str]
+    boolean_classify_implementation_roadmap_design: bool
+
+    def university_score(self) -> int:
+        if any([
+            self.boolean_classify_evidence_of_attending_Copenhagen_Business_School,
+            self.boolean_classify_evidence_of_attending_Aarhus_university,
+            self.boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet,
+            self.boolean_classify_evidence_of_attending_IT_University_of_Copenhagen,
+            self.boolean_classify_evidence_of_attending_Aalborg_University,
+        ]):
+            return 5
+
+        return 0
+
+    def gpa_score(self) -> int:
+        if self.grade_point_average is None:
+            return 0
+
+        if self.grade_point_average >= 8.5:
+            return 5
+        elif self.grade_point_average >= 7.5:
+            return 4
+        elif self.grade_point_average >= 6:
+            return 3
+        else:
+            return 1
+
+    def program_score(self) -> int:
+        if any([
+            self.boolean_classify_digital_business_management_au,
+            self.boolean_classify_business_administration_and_information_systems_cbs,
+            self.boolean_classify_management_of_innovation_and_business_development_cbs,
+            self.boolean_classify_operations_and_supply_chain_programs,
+            self.boolean_classify_engineering_with_business_specialization_dtu,
+        ]):
+            return 5
+        elif self.boolean_classify_similar_relevant_program:
+            return 4
+
+        return 0
+
+    def keyword_score(self) -> int:
+        if any([
+            self.boolean_classify_program_management,
+            self.boolean_classify_execution_and_value_realization,
+            self.boolean_classify_governance_and_operating_models,
+            self.boolean_classify_change_enablement,
+            self.boolean_classify_stakeholder_coordination,
+            self.boolean_classify_implementation_roadmap_design,
+        ]):
+            return 5
+
+        return 0
+
+    def final_score(self) -> int:
+        return (
+            self.university_score() +
+            self.gpa_score() +
+            self.program_score() +
+            self.keyword_score()
+        )
+
+
+class TechTranslator(BaseModel):
+    # UNIVERSITIES
+    extract_evidence_of_attending_IT_University_of_Copenhagen: list[str]
+    boolean_classify_evidence_of_attending_IT_University_of_Copenhagen: bool
+    extract_evidence_of_attending_Danmarks_Tekniske_Universitet: list[str]
+    boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet: bool
+    extract_evidence_of_attending_Aalborg_University: list[str]
+    boolean_classify_evidence_of_attending_Aalborg_University: bool
+    extract_evidence_of_attending_Copenhagen_Business_School_on_data_or_digital_tracks: list[str]
+    boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_data_or_digital_tracks: bool
+    extract_evidence_of_attending_University_of_Copenhagen_on_quantitative_or_data_tracks: list[str]
+    boolean_classify_evidence_of_attending_University_of_Copenhagen_on_quantitative_or_data_tracks: bool
+
+    # PROGRAMS
+    extract_evidence_of_business_intelligence_cbs_or_au: list[str]
+    boolean_classify_business_intelligence_cbs_or_au: bool
+    extract_evidence_of_business_administration_and_data_science_cbs: list[str]
+    boolean_classify_business_administration_and_data_science_cbs: bool
+    extract_evidence_of_computer_science_itu_dtu_aau: list[str]
+    boolean_classify_computer_science_itu_dtu_aau: bool
+    extract_evidence_of_data_science_programs: list[str]
+    boolean_classify_data_science_programs: bool
+    extract_evidence_of_analytics_and_information_systems_programs: list[str]
+    boolean_classify_analytics_and_information_systems_programs: bool
+
+    # SIMILAR PROGRAMS
+    boolean_classify_similar_relevant_program: bool
+
+    # GPA
+    extract_evidence_of_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    grade_point_average: float | None
+
+    # KEYWORDS
+    extract_evidence_of_data_literacy: list[str]
+    boolean_classify_data_literacy: bool
+    extract_evidence_of_ai_enablement: list[str]
+    boolean_classify_ai_enablement: bool
+    extract_evidence_of_business_it_alignment: list[str]
+    boolean_classify_business_it_alignment: bool
+    extract_evidence_of_systems_and_architecture_understanding: list[str]
+    boolean_classify_systems_and_architecture_understanding: bool
+    extract_evidence_of_analytics_interpretation: list[str]
+    boolean_classify_analytics_interpretation: bool
+    extract_evidence_of_use_case_development: list[str]
+    boolean_classify_use_case_development: bool
+    extract_evidence_of_genai_applications: list[str]
+    boolean_classify_genai_applications: bool
+
+    def university_score(self) -> int:
+        if any([
+            self.boolean_classify_evidence_of_attending_IT_University_of_Copenhagen,
+            self.boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet,
+            self.boolean_classify_evidence_of_attending_Aalborg_University,
+            self.boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_data_or_digital_tracks,
+            self.boolean_classify_evidence_of_attending_University_of_Copenhagen_on_quantitative_or_data_tracks,
+        ]):
+            return 5
+
+        return 0
+
+    def gpa_score(self) -> int:
+        if self.grade_point_average is None:
+            return 0
+
+        if self.grade_point_average >= 8.5:
+            return 5
+        elif self.grade_point_average >= 7.5:
+            return 4
+        elif self.grade_point_average >= 6:
+            return 3
+        else:
+            return 1
+
+    def program_score(self) -> int:
+        if any([
+            self.boolean_classify_business_intelligence_cbs_or_au,
+            self.boolean_classify_business_administration_and_data_science_cbs,
+            self.boolean_classify_computer_science_itu_dtu_aau,
+            self.boolean_classify_data_science_programs,
+            self.boolean_classify_analytics_and_information_systems_programs,
+        ]):
+            return 5
+        elif self.boolean_classify_similar_relevant_program:
+            return 4
+
+        return 0
+
+    def keyword_score(self) -> int:
+        if any([
+            self.boolean_classify_data_literacy,
+            self.boolean_classify_ai_enablement,
+            self.boolean_classify_business_it_alignment,
+            self.boolean_classify_systems_and_architecture_understanding,
+            self.boolean_classify_analytics_interpretation,
+            self.boolean_classify_use_case_development,
+            self.boolean_classify_genai_applications,
+        ]):
+            return 5
+
+        return 0
+
+    def final_score(self) -> int:
+        return (
+            self.university_score() +
+            self.gpa_score() +
+            self.program_score() +
+            self.keyword_score()
+        )
+
+
+class AppliedTechnicalSpecialist(BaseModel):
+    # UNIVERSITIES
+    extract_evidence_of_attending_Danmarks_Tekniske_Universitet: list[str]
+    boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet: bool
+    extract_evidence_of_attending_IT_University_of_Copenhagen: list[str]
+    boolean_classify_evidence_of_attending_IT_University_of_Copenhagen: bool
+    extract_evidence_of_attending_Aalborg_University: list[str]
+    boolean_classify_evidence_of_attending_Aalborg_University: bool
+    extract_evidence_of_attending_University_of_Copenhagen_on_science_faculty: list[str]
+    boolean_classify_evidence_of_attending_University_of_Copenhagen_on_science_faculty: bool
+    extract_evidence_of_attending_Lund_University_on_engineering_tracks: list[str]
+    boolean_classify_evidence_of_attending_Lund_University_on_engineering_tracks: bool
+    extract_evidence_of_attending_Southern_Denmark_University: list[str]
+    boolean_classify_evidence_of_attending_Southern_Denmark_University: bool
+    extract_evidence_of_attending_international_technical_programs: list[str]
+    boolean_classify_evidence_of_attending_international_technical_programs: bool
+
+    # PROGRAMS
+    extract_evidence_of_computer_science: list[str]
+    boolean_classify_computer_science: bool
+    extract_evidence_of_applied_mathematics: list[str]
+    boolean_classify_applied_mathematics: bool
+    extract_evidence_of_physics: list[str]
+    boolean_classify_physics: bool
+    extract_evidence_of_statistics: list[str]
+    boolean_classify_statistics: bool
+    extract_evidence_of_engineering_software_systems_industrial_or_energy: list[str]
+    boolean_classify_engineering_software_systems_industrial_or_energy: bool
+    extract_evidence_of_machine_learning_and_ai_programs: list[str]
+    boolean_classify_machine_learning_and_ai_programs: bool
+
+    # SIMILAR PROGRAMS
+    boolean_classify_similar_relevant_program: bool
+
+    # GPA
+    extract_evidence_of_bachelor_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    extract_evidence_of_master_grade_point_average: list[str]
+    boolean_classify_master_grade_point_average: bool
+    bachelor_grade_point_average: float | None
+    master_grade_point_average: float | None
+
+    # temp fields so this looks like the other classes.
+    extract_evidence_of_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    grade_point_average: float | None
+
+    # KEYWORDS
+    extract_evidence_of_advanced_quantitative_methods: list[str]
+    boolean_classify_advanced_quantitative_methods: bool
+    extract_evidence_of_machine_learning_and_modelling: list[str]
+    boolean_classify_machine_learning_and_modelling: bool
+    extract_evidence_of_algorithmic_thinking: list[str]
+    boolean_classify_algorithmic_thinking: bool
+    extract_evidence_of_statistical_analysis: list[str]
+    boolean_classify_statistical_analysis: bool
+    extract_evidence_of_optimization_and_simulation: list[str]
+    boolean_classify_optimization_and_simulation: bool
+    extract_evidence_of_technical_solution_development: list[str]
+    boolean_classify_technical_solution_development: bool
+    extract_evidence_of_systems_engineering: list[str]
+    boolean_classify_systems_engineering: bool
+
+    # SCORE: UNIVERSITIES
+    def university_score(self):
+        if any([
+            self.boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet,
+            self.boolean_classify_evidence_of_attending_IT_University_of_Copenhagen,
+            self.boolean_classify_evidence_of_attending_Aalborg_University,
+            self.boolean_classify_evidence_of_attending_University_of_Copenhagen_on_science_faculty,
+            self.boolean_classify_evidence_of_attending_Lund_University_on_engineering_tracks,
+        ]):
+            return 5
+
+        elif any([
+            self.boolean_classify_evidence_of_attending_Southern_Denmark_University,
+            self.boolean_classify_evidence_of_attending_international_technical_programs,
+        ]):
+            return 4
+
+        else:
+            return 0
+
+
+    # SCORE: GPA
+    # OBS: scorecardet skelner mellem master og bachelor grades,
+    # men din klasse har kun ét samlet grade_point_average-felt.
+    def gpa_score(self):
+        if self.grade_point_average is None:
+            return 0
+
+        gpa = self.grade_point_average
+
+        if gpa >= 8.5:
+            return 5
+        elif gpa >= 7.5:
+            return 4
+        elif gpa >= 6:
+            return 3
+        else:
+            return 1
+
+
+    # SCORE PROGRAM
+    def program_score(self):
+        if any([
+            self.boolean_classify_computer_science,
+            self.boolean_classify_applied_mathematics,
+            self.boolean_classify_physics,
+            self.boolean_classify_statistics,
+            self.boolean_classify_engineering_software_systems_industrial_or_energy,
+            self.boolean_classify_machine_learning_and_ai_programs,
+        ]):
+            return 5
+
+        elif self.boolean_classify_similar_relevant_program:
+            return 4
+
+        else:
+            return 0
+
+
+    # SCORE KEYWORDS
+    def keyword_score(self):
+        if any([
+            self.boolean_classify_advanced_quantitative_methods,
+            self.boolean_classify_machine_learning_and_modelling,
+            self.boolean_classify_algorithmic_thinking,
+            self.boolean_classify_statistical_analysis,
+            self.boolean_classify_optimization_and_simulation,
+            self.boolean_classify_technical_solution_development,
+            self.boolean_classify_systems_engineering,
+        ]):
+            return 5
+        else:
+            return 0
+
+
+    # FINAL SCORE
+    def final_score(self):
+        return (
+            self.university_score() +
+            self.gpa_score() +
+            self.program_score() +
+            self.keyword_score()
+        )
+
+class IndustryFunctionalSpecialist(BaseModel):
+    # UNIVERSITIES
+    extract_evidence_of_attending_University_of_Copenhagen_on_life_science_or_public_sector_tracks: list[str]
+    boolean_classify_evidence_of_attending_University_of_Copenhagen_on_life_science_or_public_sector_tracks: bool
+    extract_evidence_of_attending_Danmarks_Tekniske_Universitet_on_energy_or_engineering_tracks: list[str]
+    boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet_on_energy_or_engineering_tracks: bool
+    extract_evidence_of_attending_Copenhagen_Business_School_on_financial_services_or_commercial_tracks: list[str]
+    boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_financial_services_or_commercial_tracks: bool
+    extract_evidence_of_attending_Aarhus_university: list[str]
+    boolean_classify_evidence_of_attending_Aarhus_university: bool
+    extract_evidence_of_attending_Lund_University: list[str]
+    boolean_classify_evidence_of_attending_Lund_University: bool
+    extract_evidence_of_attending_Roskilde_University: list[str]
+    boolean_classify_evidence_of_attending_Roskilde_University: bool
+    extract_evidence_of_attending_Southern_Denmark_University: list[str]
+    boolean_classify_evidence_of_attending_Southern_Denmark_University: bool
+    extract_evidence_of_attending_Aalborg_University: list[str]
+    boolean_classify_evidence_of_attending_Aalborg_University: bool
+
+    # PROGRAMS
+    extract_evidence_of_applied_economics_and_finance_ku: list[str]
+    boolean_classify_applied_economics_and_finance_ku: bool
+    extract_evidence_of_finance_and_strategic_management_cbs: list[str]
+    boolean_classify_finance_and_strategic_management_cbs: bool
+    extract_evidence_of_life_science_or_biomed_programs_ku_dtu_lund: list[str]
+    boolean_classify_life_science_or_biomed_programs_ku_dtu_lund: bool
+    extract_evidence_of_energy_and_engineering_programs_dtu_aau: list[str]
+    boolean_classify_energy_and_engineering_programs_dtu_aau: bool
+    extract_evidence_of_supply_chain_and_operations_programs: list[str]
+    boolean_classify_supply_chain_and_operations_programs: bool
+    extract_evidence_of_public_policy_or_political_science_ku_au: list[str]
+    boolean_classify_public_policy_or_political_science_ku_au: bool
+
+    # SIMILAR PROGRAMS
+    boolean_classify_similar_relevant_program: bool
+
+    # GPA
+    extract_evidence_of_grade_point_average: list[str]
+    boolean_classify_evidence_of_grade_point_average: bool
+    grade_point_average: float | None
+
+    # KEYWORDS
+    extract_evidence_of_industry_expertise: list[str]
+    boolean_classify_industry_expertise: bool
+    extract_evidence_of_regulatory_knowledge: list[str]
+    boolean_classify_regulatory_knowledge: bool
+    extract_evidence_of_value_chain_insight: list[str]
+    boolean_classify_value_chain_insight: bool
+    extract_evidence_of_commercial_awareness: list[str]
+    boolean_classify_commercial_awareness: bool
+    extract_evidence_of_sector_strategy: list[str]
+    boolean_classify_sector_strategy: bool
+    extract_evidence_of_domain_specific_analytics: list[str]
+    boolean_classify_domain_specific_analytics: bool
+    extract_evidence_of_strategy_execution: list[str]
+    boolean_classify_strategy_execution: bool
+
+    def university_score(self) -> int:
+        if any([
+            self.boolean_classify_evidence_of_attending_University_of_Copenhagen_on_life_science_or_public_sector_tracks,
+            self.boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet_on_energy_or_engineering_tracks,
+            self.boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_financial_services_or_commercial_tracks,
+            self.boolean_classify_evidence_of_attending_Aarhus_university,
+            self.boolean_classify_evidence_of_attending_Lund_University,
+        ]):
+            return 5
+        elif any([
+            self.boolean_classify_evidence_of_attending_Roskilde_University,
+            self.boolean_classify_evidence_of_attending_Southern_Denmark_University,
+            self.boolean_classify_evidence_of_attending_Aalborg_University,
+        ]):
+            return 4
+
+        return 0
+
+    def gpa_score(self) -> int:
+        if self.grade_point_average is None:
+            return 0
+
+        if self.grade_point_average >= 8.5:
+            return 5
+        elif self.grade_point_average >= 7.5:
+            return 4
+        elif self.grade_point_average >= 6:
+            return 3
+        else:
+            return 1
+
+    def program_score(self) -> int:
+        if any([
+            self.boolean_classify_applied_economics_and_finance_ku,
+            self.boolean_classify_finance_and_strategic_management_cbs,
+            self.boolean_classify_life_science_or_biomed_programs_ku_dtu_lund,
+            self.boolean_classify_energy_and_engineering_programs_dtu_aau,
+            self.boolean_classify_supply_chain_and_operations_programs,
+            self.boolean_classify_public_policy_or_political_science_ku_au,
+        ]):
+            return 5
+        elif self.boolean_classify_similar_relevant_program:
+            return 4
+
+        return 0
+
+    def keyword_score(self) -> int:
+        if any([
+            self.boolean_classify_industry_expertise,
+            self.boolean_classify_regulatory_knowledge,
+            self.boolean_classify_value_chain_insight,
+            self.boolean_classify_commercial_awareness,
+            self.boolean_classify_sector_strategy,
+            self.boolean_classify_domain_specific_analytics,
+            self.boolean_classify_strategy_execution,
+        ]):
+            return 5
+
+        return 0
+
+    def final_score(self) -> int:
+        return (
+            self.university_score() +
+            self.gpa_score() +
+            self.program_score() +
+            self.keyword_score()
+        )
+
+#definer funktioner for at læse pdf
+norm = lambda t: re.sub(r"[^\w\s:/().,+-]", "", re.sub(r"\s+", " ", t.lower())).strip()
+
+def extract_word_tokens(b):
+    out = []
+    with pdfplumber.open(BytesIO(b)) as pdf:
+        for p, page in enumerate(pdf.pages):
+            words = page.extract_words()
+            mid = page.width * 0.4
+
+            left = [w for w in words if w["x0"] < mid]
+            right = [w for w in words if w["x0"] >= mid]
+
+            # treat as 2 columns
+            if len(left) > len(words) * 0.2 and len(right) > len(words) * 0.2:
+                words = sorted(left, key=lambda w: (w["top"], w["x0"])) + sorted(right, key=lambda w: (w["top"], w["x0"]))
+            
+            # treat as 1 column
+            else:
+                words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+
+            out += [
+                {
+                    "text": w["text"],
+                    "norm": norm(w["text"]),
+                    "page": p,
+                    "x0": w["x0"],
+                    "top": w["top"],
+                    "x1": w["x1"],
+                    "bottom": w["bottom"],
+                }
+                for w in words
+            ]
+    return out
+
+def best_window_match(f, t, s=2):
+    if isinstance(f, list):
+        f = " ".join(f)
+
+    trg = " ".join(norm(w) for w in f.split() if norm(w))
+    if not trg: 
+        return None
+
+    n, best = len(trg.split()), None
+
+    for z in range(max(1, n-s), n+s+1):
+        for i in range(len(t)-z+1):
+            w = t[i:i+z]
+
+            if len({x["page"] for x in w}) > 1: 
+                continue
+
+            c = " ".join(x["norm"] for x in w if x["norm"])
+            sc = Levenshtein.distance(c, trg) / max(len(trg), 1)
+
+            if not best or sc < best["score"]:
+                best = {"score": sc, "tokens": w}
+
+    return best if best and best["score"] <= 0.25 else None
+
+def collect_text_matches(fields, tokens, clean_targets=True):
+    matches = []
+    for f in fields:
+        if not f:
+            continue
+
+        target = clean_field(f) if clean_targets else f
+        m = best_window_match(target, tokens)
+
+        print("TARGET:", target)
+        print("MATCH:", " ".join(tok["text"] for tok in m["tokens"]) if m else None)
+        print("----")
+
+        if m:
+            matches.append(m)
+        
+    return matches
+
+def collect_evidence_matches(npa, tokens):
+    fields = [
+        npa.name,
+        *(npa.master_education or []),
+        *(npa.master_gpa or []),
+        *(npa.bachelor_education or []),
+        *(npa.bachelor_gpa or []),
+        *(npa.international_experience or []),
+        *(npa.exchange_education or []),
+        *(npa.student_job or []),
+    ]
+
+    return collect_text_matches(fields, tokens)
+
+def is_usable_evidence(value):
+    if not isinstance(value, str):
+        return False
+
+    cleaned = norm(value)
+    return bool(cleaned) and cleaned not in {"n/a", "na", "none", "null", "not mentioned", "not applicable"}
+
+def model_field_names(model):
+    if hasattr(model, "model_fields"):
+        return model.model_fields.keys()
+    return model.__fields__.keys()
+
+def matching_boolean_field(evidence_field, field_names):
+    suffix = evidence_field.removeprefix("extract_evidence_of_")
+    candidates = [
+        f"boolean_classify_{suffix}",
+        f"boolean_classify_evidence_of_{suffix}",
+    ]
+
+    if suffix.startswith("bachelor_"):
+        candidates.append(f"boolean_classify_evidence_of_{suffix.removeprefix('bachelor_')}")
+
+    for candidate in candidates:
+        if candidate in field_names:
+            return candidate
+
+    return None
+
+def collect_persona_evidence(persona):
+    field_names = set(model_field_names(persona))
+    evidence = []
+
+    for field_name in field_names:
+        if not field_name.startswith("extract_evidence_of_"):
+            continue
+
+        boolean_field = matching_boolean_field(field_name, field_names)
+        if not boolean_field or not getattr(persona, boolean_field, False):
+            continue
+
+        value = getattr(persona, field_name, None)
+        values = value if isinstance(value, list) else [value]
+        evidence.extend(v for v in values if is_usable_evidence(v))
+
+    return evidence
+
+def true_boolean_count(model):
+    return sum(
+        1
+        for field_name in model_field_names(model)
+        if field_name.startswith("boolean_") and getattr(model, field_name, False) is True
+    )
+
+def true_boolean_fields(model):
+    return [
+        field_name
+        for field_name in model_field_names(model)
+        if field_name.startswith("boolean_") and getattr(model, field_name, False) is True
+    ]
+
+def readable_boolean_label(field_name):
+    label = field_name
+    for prefix in [
+        "boolean_classify_evidence_of_",
+        "boolean_classify_",
+    ]:
+        if label.startswith(prefix):
+            label = label.removeprefix(prefix)
+            break
+
+    return label.replace("_", " ")
+
+UNIVERSITY_FIELDS = {
+    "TechStrategist": [
+        "boolean_classify_evidence_of_attending_Copenhagen_Business_School",
+        "boolean_classify_evidence_of_attending_Aarhus_university",
+        "boolean_classify_evidence_of_attending_University_of_Copenhagen",
+        "boolean_classify_evidence_of_affending_Danmarks_Tekniske_Universitet_on_a_tech_management_track",
+        "boolean_classify_evidence_of_attending_Lund_University",
+    ],
+    "TransformationOrchestratorPMO": [
+        "boolean_classify_evidence_of_attending_Copenhagen_Business_School",
+        "boolean_classify_evidence_of_attending_Aarhus_university",
+        "boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet",
+        "boolean_classify_evidence_of_attending_IT_University_of_Copenhagen",
+        "boolean_classify_evidence_of_attending_Aalborg_University",
+    ],
+    "TechTranslator": [
+        "boolean_classify_evidence_of_attending_IT_University_of_Copenhagen",
+        "boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet",
+        "boolean_classify_evidence_of_attending_Aalborg_University",
+        "boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_data_or_digital_tracks",
+        "boolean_classify_evidence_of_attending_University_of_Copenhagen_on_quantitative_or_data_tracks",
+    ],
+    "AppliedTechnicalSpecialist": [
+        "boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet",
+        "boolean_classify_evidence_of_attending_IT_University_of_Copenhagen",
+        "boolean_classify_evidence_of_attending_Aalborg_University",
+        "boolean_classify_evidence_of_attending_University_of_Copenhagen_on_science_faculty",
+        "boolean_classify_evidence_of_attending_Lund_University_on_engineering_tracks",
+        "boolean_classify_evidence_of_attending_Southern_Denmark_University",
+        "boolean_classify_evidence_of_attending_international_technical_programs",
+    ],
+    "IndustryFunctionalSpecialist": [
+        "boolean_classify_evidence_of_attending_University_of_Copenhagen_on_life_science_or_public_sector_tracks",
+        "boolean_classify_evidence_of_attending_Danmarks_Tekniske_Universitet_on_energy_or_engineering_tracks",
+        "boolean_classify_evidence_of_attending_Copenhagen_Business_School_on_financial_services_or_commercial_tracks",
+        "boolean_classify_evidence_of_attending_Aarhus_university",
+        "boolean_classify_evidence_of_attending_Lund_University",
+        "boolean_classify_evidence_of_attending_Roskilde_University",
+        "boolean_classify_evidence_of_attending_Southern_Denmark_University",
+        "boolean_classify_evidence_of_attending_Aalborg_University",
+    ],
+}
+
+PROGRAM_FIELDS = {
+    "TechStrategist": [
+        "boolean_classify_business_admin_digital_business_cbs",
+        "boolean_classify_strategy_org_leadership_cbs",
+        "boolean_classify_innovation_business_dev_cbs",
+        "boolean_classify_economics_ku_au",
+        "boolean_classify_international_business_cbs_au",
+        "boolean_classify_digital_business_management_au",
+    ],
+    "TransformationOrchestratorPMO": [
+        "boolean_classify_digital_business_management_au",
+        "boolean_classify_business_administration_and_information_systems_cbs",
+        "boolean_classify_management_of_innovation_and_business_development_cbs",
+        "boolean_classify_operations_and_supply_chain_programs",
+        "boolean_classify_engineering_with_business_specialization_dtu",
+    ],
+    "TechTranslator": [
+        "boolean_classify_business_intelligence_cbs_or_au",
+        "boolean_classify_business_administration_and_data_science_cbs",
+        "boolean_classify_computer_science_itu_dtu_aau",
+        "boolean_classify_data_science_programs",
+        "boolean_classify_analytics_and_information_systems_programs",
+    ],
+    "AppliedTechnicalSpecialist": [
+        "boolean_classify_computer_science",
+        "boolean_classify_applied_mathematics",
+        "boolean_classify_physics",
+        "boolean_classify_statistics",
+        "boolean_classify_engineering_software_systems_industrial_or_energy",
+        "boolean_classify_machine_learning_and_ai_programs",
+    ],
+    "IndustryFunctionalSpecialist": [
+        "boolean_classify_applied_economics_and_finance_ku",
+        "boolean_classify_finance_and_strategic_management_cbs",
+        "boolean_classify_life_science_or_biomed_programs_ku_dtu_lund",
+        "boolean_classify_energy_and_engineering_programs_dtu_aau",
+        "boolean_classify_supply_chain_and_operations_programs",
+        "boolean_classify_public_policy_or_political_science_ku_au",
+    ],
+}
+
+def education_boolean_fields(persona_name):
+    return set(UNIVERSITY_FIELDS.get(persona_name, [])) | set(PROGRAM_FIELDS.get(persona_name, [])) | {
+        "boolean_classify_similar_relevant_program",
+    }
+
+def persona_reasoning_boolean_fields(persona, persona_name):
+    excluded_fields = education_boolean_fields(persona_name)
+    return [
+        field_name
+        for field_name in true_boolean_fields(persona)
+        if field_name not in excluded_fields
+    ]
+
+def persona_reasoning_boolean_count(persona, persona_name):
+    return len(persona_reasoning_boolean_fields(persona, persona_name))
+
+MASTER_UNIVERSITY_TIERS = {
+    "TechStrategist": {
+        "primary": [
+            "cbs",
+            "copenhagen business school",
+            "aarhus university",
+            "university of copenhagen",
+            "københavns universitet",
+        ],
+        "secondary": [
+            "dtu",
+            "danmarks tekniske universitet",
+            "technical university of denmark",
+            "lund university",
+        ],
+    },
+    "TransformationOrchestratorPMO": {
+        "primary": [
+            "cbs",
+            "copenhagen business school",
+            "aarhus university",
+            "dtu",
+            "danmarks tekniske universitet",
+            "technical university of denmark",
+        ],
+        "secondary": [
+            "itu",
+            "it university of copenhagen",
+            "aalborg university",
+            "aau",
+        ],
+    },
+    "TechTranslator": {
+        "primary": [
+            "itu",
+            "it university of copenhagen",
+            "dtu",
+            "danmarks tekniske universitet",
+            "technical university of denmark",
+            "aalborg university",
+            "aau",
+        ],
+        "secondary": [
+            "cbs",
+            "copenhagen business school",
+            "university of copenhagen",
+            "københavns universitet",
+        ],
+    },
+    "AppliedTechnicalSpecialist": {
+        "primary": [
+            "dtu",
+            "danmarks tekniske universitet",
+            "technical university of denmark",
+            "itu",
+            "it university of copenhagen",
+            "aalborg university",
+            "aau",
+            "university of copenhagen",
+            "københavns universitet",
+            "lund university",
+        ],
+        "secondary": [
+            "sdu",
+            "southern denmark university",
+            "university of southern denmark",
+            "international technical",
+        ],
+    },
+    "IndustryFunctionalSpecialist": {
+        "primary": [
+            "university of copenhagen",
+            "københavns universitet",
+            "dtu",
+            "danmarks tekniske universitet",
+            "technical university of denmark",
+            "cbs",
+            "copenhagen business school",
+            "aarhus university",
+            "lund university",
+        ],
+        "secondary": [
+            "ruc",
+            "roskilde university",
+            "sdu",
+            "southern denmark university",
+            "university of southern denmark",
+            "aalborg university",
+            "aau",
+        ],
+    },
+}
+
+MASTER_PROGRAM_TERMS = {
+    "TechStrategist": {
+        "target": [
+            "business administration and digital business",
+            "business admin digital business",
+            "digital business",
+            "strategy organization leadership",
+            "strategy organisation leadership",
+            "strategy org leadership",
+            "management of innovation",
+            "innovation business development",
+            "economics",
+            "international business",
+            "digital business management",
+        ],
+        "similar": [
+            "business development",
+            "innovation",
+            "strategy",
+            "technology management",
+            "tech management",
+        ],
+    },
+    "TransformationOrchestratorPMO": {
+        "target": [
+            "digital business management",
+            "business administration and information systems",
+            "information systems",
+            "management of innovation",
+            "innovation business development",
+            "operations",
+            "supply chain",
+            "engineering with business",
+        ],
+        "similar": [
+            "project management",
+            "program management",
+            "business development",
+            "operations management",
+        ],
+    },
+    "TechTranslator": {
+        "target": [
+            "business intelligence",
+            "business administration and data science",
+            "data science",
+            "computer science",
+            "analytics",
+            "information systems",
+        ],
+        "similar": [
+            "digital business",
+            "information management",
+            "business analytics",
+            "data analytics",
+        ],
+    },
+    "AppliedTechnicalSpecialist": {
+        "target": [
+            "computer science",
+            "applied mathematics",
+            "physics",
+            "statistics",
+            "engineering",
+            "software",
+            "systems",
+            "industrial",
+            "energy",
+            "machine learning",
+            "artificial intelligence",
+            "ai",
+        ],
+        "similar": [
+            "mathematics",
+            "data science",
+            "quantitative",
+            "technical",
+        ],
+    },
+    "IndustryFunctionalSpecialist": {
+        "target": [
+            "applied economics and finance",
+            "finance and strategic management",
+            "finance",
+            "life science",
+            "biomed",
+            "biomedical",
+            "energy",
+            "engineering",
+            "supply chain",
+            "operations",
+            "public policy",
+            "political science",
+        ],
+        "similar": [
+            "economics",
+            "public administration",
+            "commercial",
+            "sector",
+        ],
+    },
+}
+
+def score_master_university(master_education, persona_name):
+    master_text = norm(join_values(master_education))
+    tiers = MASTER_UNIVERSITY_TIERS.get(persona_name, {})
+
+    if any(university in master_text for university in tiers.get("primary", [])):
+        return 2
+    if any(university in master_text for university in tiers.get("secondary", [])):
+        return 1
+
+    return 0
+
+def master_university_weight_label(score):
+    if score == 2:
+        return "primary master university"
+    if score == 1:
+        return "secondary master university"
+    return "no master university match"
+
+def score_program_fit(persona, persona_name, master_education):
+    master_text = norm(join_values(master_education))
+    terms = MASTER_PROGRAM_TERMS.get(persona_name, {})
+
+    if any(term in master_text for term in terms.get("target", [])):
+        return 2
+    if any(term in master_text for term in terms.get("similar", [])):
+        return 1
+
+    return 0
+
+def program_weight_label(score):
+    if score == 2:
+        return "target program"
+    if score == 1:
+        return "similar program"
+    return "no program match"
+
+def format_persona_fit_report(persona_name, persona, reasoning_count, master_university_score, program_score, persona_score):
+    true_labels = [
+        readable_boolean_label(field_name)
+        for field_name in persona_reasoning_boolean_fields(persona, persona_name)
+    ]
+    true_boolean_lines = "\n".join(f"- {label}" for label in true_labels) or "- None"
+
+    return (
+        f"#### {persona_name}\n"
+        f"**Persona score: {persona_score}**\n\n"
+        f"- Non-education true booleans: {reasoning_count}\n"
+        f"- Master university weight: {master_university_score} ({master_university_weight_label(master_university_score)})\n"
+        f"- Program weight: {program_score} ({program_weight_label(program_score)})\n\n"
+        f"**Non-education true booleans**\n"
+        f"{true_boolean_lines}"
+    )
+
+def first_float(values):
+    if isinstance(values, str):
+        values = [values]
+
+    for value in values or []:
+        match = re.search(r"\d+(?:[,.]\d+)?", str(value))
+        if match:
+            return float(match.group(0).replace(",", "."))
+
+    return None
+
+def score_master_grade(master_gpa):
+    gpa = first_float(master_gpa)
+    if gpa is None:
+        return 2
+    if gpa >= 8.5:
+        return 5
+    if gpa >= 7.5:
+        return 4
+    if gpa >= 6:
+        return 3
+    return 1
+
+def score_bachelor_grade(bachelor_gpa):
+    gpa = first_float(bachelor_gpa)
+    if gpa is None:
+        return 2
+    if gpa >= 8:
+        return 5
+    if gpa > 7:
+        return 4
+    if gpa >= 5.5:
+        return 3
+    return 1
+
+def score_student_job(student_job):
+    text = norm(" ".join(student_job or []))
+    if not text:
+        return 0
+
+    strong_terms = [
+        "software development",
+        "software developer",
+        "backend",
+        "back end",
+        "operations",
+        "system development",
+        "systems development",
+    ]
+    if any(term in text for term in strong_terms):
+        return 4
+
+    return 1
+
+def binary_score(value):
+    if isinstance(value, list):
+        return 1 if any(is_usable_evidence(v) for v in value) else 0
+
+    return 1 if is_usable_evidence(value) else 0
+
+def score_nordic_language(value):
+    text = norm(value or "")
+    return 1 if any(language in text for language in ["danish", "dansk", "swedish", "svensk", "norwegian", "norsk"]) else 0
+
+def normalize_gender(value):
+    text = norm(value or "")
+    if text in {"f", "female", "woman", "kvinde"}:
+        return "F"
+    if text in {"m", "male", "man", "mand"}:
+        return "M"
+    return "Unknown"
+
+def build_scorecard(npa, persona_score):
+    scorecard = {
+        "master_grade_score": score_master_grade(npa.master_gpa),
+        "bachelor_grade_score": score_bachelor_grade(npa.bachelor_gpa),
+        "student_job_score": score_student_job(npa.student_job),
+        "extracurricular_score": binary_score(npa.extracurricular),
+        "international_experience_score": binary_score(npa.international_experience or npa.exchange_education),
+        "nordic_language_score": score_nordic_language(npa.nordic_language),
+    }
+
+    scorecard["final_score"] = persona_score + sum(scorecard.values())
+    return scorecard
+
+def join_values(values):
+    if isinstance(values, list):
+        return ", ".join(str(value) for value in values if value)
+    return values or ""
+
+def combine_values(*values):
+    combined = []
+
+    for value in values:
+        if isinstance(value, list):
+            combined.extend(item for item in value if item)
+        elif value:
+            combined.append(value)
+
+    return combined
+
+def build_candidate_row(npa, selected_persona, persona_score, scorecard):
+    international_experience = combine_values(npa.international_experience, npa.exchange_education)
+
+    return {
+        "name": npa.name or "",
+        "master_education": join_values(npa.master_education),
+        "master_gpa": join_values(npa.master_gpa),
+        "master_grade_score": scorecard["master_grade_score"],
+        "bachelor_education": join_values(npa.bachelor_education),
+        "bachelor_gpa": join_values(npa.bachelor_gpa),
+        "bachelor_grade_score": scorecard["bachelor_grade_score"],
+        "international_experience": join_values(international_experience),
+        "student_job": join_values(npa.student_job),
+        "student_job_score": scorecard["student_job_score"],
+        "extracurricular": join_values(npa.extracurricular),
+        "extracurricular_score": scorecard["extracurricular_score"],
+        "international_experience_score": scorecard["international_experience_score"],
+        "nordic_language": npa.nordic_language or "",
+        "nordic_language_score": scorecard["nordic_language_score"],
+        "gender": normalize_gender(npa.gender),
+        "selected_persona": selected_persona,
+        "persona_score": persona_score,
+        "final_score": scorecard["final_score"],
+    }
+
+def format_scorecard_report(row):
+    return (
+        f"### Selected persona\n"
+        f"**{row['selected_persona']}** (persona score: {row['persona_score']})\n\n"
+        f"### Candidate scorecard\n"
+        f"- Master grade: {row['master_grade_score']}\n"
+        f"- Bachelor grade: {row['bachelor_grade_score']}\n"
+        f"- Student job/internship: {row['student_job_score']}\n"
+        f"- Extracurricular: {row['extracurricular_score']}\n"
+        f"- International experience: {row['international_experience_score']}\n"
+        f"- Danish/Swedish/Norwegian: {row['nordic_language_score']}\n"
+        f"- Gender: {row['gender']}\n"
+        f"- Persona score: {row['persona_score']}\n"
+        f"- **Final score: {row['final_score']}**"
+    )
+
+EXCEL_HEADERS = [
+    "name",
+    "master_education",
+    "master_gpa",
+    "master_grade_score",
+    "bachelor_education",
+    "bachelor_gpa",
+    "bachelor_grade_score",
+    "international_experience",
+    "international_experience_score",
+    "student_job",
+    "student_job_score",
+    "extracurricular",
+    "extracurricular_score",
+    "nordic_language",
+    "nordic_language_score",
+    "gender",
+    "selected_persona",
+    "persona_score",
+    "final_score",
+]
+
+def clean_field(f):
+    if isinstance(f, list):
+        f = " ".join(f)
+
+    f = f.strip()
+
+    if len(f.split()) <= 3 and not re.search(r"\d", f):
+        return f.upper()
+
+    # handle short fields like names
+    if len(f.split()) <= 3:
+        return f.upper()
+
+    # keep GPA numbers
+    m = re.search(r"\d+(?:\.\d+)?/12", f)
+    if m:
+        return m.group(0)
+
+    # remove brackets (dates etc.)
+    f = re.sub(r"\([^)]*\)", "", f)
+
+    lower_f = f.lower()
+    if "bachelor" in lower_f or lower_f.startswith("ba "):
+        return "BA"
+    if "master" in lower_f or "master’s" in lower_f or "master of" in lower_f:
+        return "Master"
+    
+    return f.strip()
+
+   
+async def send_input():
+    #analysis_clases = [IndustryFunctionalSpecialist]
+    analysis_clases = [TechStrategist, TransformationOrchestratorPMO, TechTranslator, AppliedTechnicalSpecialist, IndustryFunctionalSpecialist]
+    
+    progress.visible = True
+    progress.value = 0.3
+
+    for v in [0.2, 0.4, 0.6, 0.8]:
+        progress.value = v
+        label.text = f'{int(v*100)}%'
+        await asyncio.sleep(0.1)
+
+        # your real logic here
+        progress.value = 1
+        label.text = '100%'
+
+        await asyncio.sleep(0.2)
+        progress.visible = False
+        label.visible = False
+
+    try:
+        await asyncio.sleep(2)
+
+        t = f"CV:\n{cv_raw_text}\n\nCOVER LETTER:\n{cover_raw_text}"
+
+        print("TEXT LENGTH:", len(t)) 
+        print("FULL TEXT:", repr(t))
+
+        candidate_task = client.beta.chat.completions.parse(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": (
+                    "Extract all bachelor entries and bachelor GPA values from the text. "
+                    "Extract all master entries and master GPA values from the text. "
+                    "For master_education, include both the university/institution name and the degree/program name when present. "
+                    "Extract all international experience entries from the text (if any). "
+                    "International experience may be written as 'exchange', 'exchange semester', 'exchange program', 'study abroad', lived abroad, studied abroad, worked abroad, or similar. "
+                    "Student job refers to the most recent relevant student job experience mentioned in the text, and may be written as 'student job', 'student assistant', 'internship', or similar. "
+                    "Extract extracurricular activities, including student organizations, voluntary work, elite athletics, board roles, clubs, or similar. "
+                    "Extract international experience, including living, studying, or working abroad. "
+                    "Extract whether the candidate speaks Danish, Swedish, or Norwegian if explicitly present. "
+                    "Extract gender only if it is explicitly stated in the CV or cover letter. Return F, M, or Unknown. Do not infer gender from the candidate's name or pronouns. "
+                    "GPA may be written as 'grade average', 'average grade', or similar. "
+                    "The GPA may appear on the same line or the next line after the label. "
+                    "Return the GPA's exactly as written. "
+                    "For each extracted value, also return the exact snippet from the text that supports it. "
+                    "Return all entries you find, not just the most recent one. "
+                    "education_snippets should be short exact substrings from the text."
+                    "If a value is not explicitly present, return null. Do not guess. "
+                    + system_instructions
+                )},
+                {"role": "user", "content": t},
+            ],
+            response_format=CandidateInfo,
+        )
+
+
+        for c in analysis_clases:
+            print(f"Starting persona analysis for {c.__name__}...")
+
+        persona_tasks = [
+            client.beta.chat.completions.parse(
+                model="gpt-4.1",
+                messages=[
+                    {"role": "system", "content": (
+                        system_instructions
+                        + f"Classify the candidate according to the {c.__name__} role, and extract evidence for each classification. "
+                        "Use the provided persona criteria exactly as written. Do not redefine, narrow, expand, or replace the criteria. "
+                        "Use a strict evidence standard. Only mark a boolean true when the CV or cover letter contains explicit, concrete, role-specific evidence for that exact criterion. "
+                        "The CV and cover letter may be in Danish. You may understand Danish, but do not over-translate broad Danish business terms into persona criteria unless the text contains concrete supporting evidence. "
+                        "Do not mark a criterion true based only on generic words such as analyse, analyser, data, digitalisering, IT, systemer, processer, rapportering, strategi, projekt, stakeholder, forretning, udvikling, optimering, transformation, implementering, koordinering, or rådgivning. "
+                        "Generic consulting, business, strategy, project, process, stakeholder, analysis, reporting, or digitalization language is insufficient by itself. "
+                        "When a candidate has evidence that could fit multiple personas, assign the evidence only to the persona criteria it directly supports. Do not stretch evidence to make it fit another persona. "
+                        "Important boundary rule: do not classify strategic/digital-business evidence as applied technical evidence unless the text directly supports the applied technical criterion. "
+                        "Important boundary rule: do not classify general technical exposure or interest as hands-on applied technical evidence. "
+                        "Important boundary rule: do not classify general business analysis or reporting as Tech Translator evidence unless the text directly supports translation between business and technical/data domains or another specific Tech Translator criterion. "
+                        "Important boundary rule: do not classify generic commercial, strategy, or sector language as Industry/Functional Specialist evidence unless the text directly supports concrete domain, sector, regulatory, value-chain, or functional expertise. "
+                        "For program criteria, only mark exact target programs true when the education name clearly matches the target program. Use similar_relevant_program only when the program is explicitly close in subject matter, not merely business-related. "
+                        "For university criteria, only mark true when the relevant university is explicitly stated. Do not infer from location, language, or exchange references. "
+                        "For each true boolean, the extracted evidence must be a short exact substring from the text that directly supports the criterion. "
+                        "If the evidence is weak, vague, generic, indirect, translated too broadly, or only semantically adjacent, mark the boolean false and return an empty evidence list for that criterion. "
+                        "Prefer false over true when uncertain."
+                    )},
+                    {"role": "user", "content": t},
+                ],
+                response_format=c,
+            )
+            for c in analysis_clases
+        ]
+
+        completion, *persona_analyses = await asyncio.gather(
+            candidate_task,
+            *persona_tasks,
+        )
+
+        for analysis in persona_analyses:
+            print(analysis)
+
+        persona_results = []
+        persona_score_lines = []
+        npa = completion.choices[0].message.parsed
+
+        for persona_class, analysis in zip(analysis_clases, persona_analyses):
+            parsed_persona = analysis.choices[0].message.parsed
+            true_count = persona_reasoning_boolean_count(parsed_persona, persona_class.__name__)
+            master_university_score = score_master_university(npa.master_education, persona_class.__name__)
+            program_score = score_program_fit(parsed_persona, persona_class.__name__, npa.master_education)
+            persona_score = true_count + master_university_score + program_score
+            persona_results.append((persona_class, parsed_persona, persona_score))
+            persona_score_lines.append(
+                format_persona_fit_report(
+                    persona_class.__name__,
+                    parsed_persona,
+                    true_count,
+                    master_university_score,
+                    program_score,
+                    persona_score,
+                )
+            )
+
+        highest_score = max(persona_score for _, _, persona_score in persona_results)
+        winning_persona_class, winning_persona, _ = random.choice([
+            result for result in persona_results if result[2] == highest_score
+        ])
+        winning_persona_evidence = collect_persona_evidence(winning_persona)
+
+        global all_candidates
+        scorecard = build_scorecard(npa, highest_score)
+        candidate_row = build_candidate_row(npa, winning_persona_class.__name__, highest_score, scorecard)
+        all_candidates.append(candidate_row)
+
+        persona_score_lines.append(format_scorecard_report(candidate_row))
+        score_area.content = "### Persona fit\n" + "\n".join(persona_score_lines)
+        score_area.update()
+
+        print(npa)
+
+        output_area.value = (
+            f"name={npa.name}\n"
+            f"master_education={npa.master_education}\n"
+            f"master_gpa={npa.master_gpa}\n"
+            f"bachelor_education={npa.bachelor_education}\n"
+            f"bachelor_gpa={npa.bachelor_gpa}\n"
+            f"international_experience={join_values(combine_values(npa.international_experience, npa.exchange_education))}\n"
+            f"student_job={npa.student_job}\n"
+            f"extracurricular={npa.extracurricular}\n"
+            f"nordic_language={npa.nordic_language}\n"
+            f"gender={npa.gender}\n"
+            f"selected_persona={candidate_row['selected_persona']}\n"
+            f"final_score={candidate_row['final_score']}"
+            )
+        
+        for persona_analysis in persona_analyses[:1]:
+            output_area.value += f"\n\n{persona_analysis}"
+        
+        cv_matches = collect_evidence_matches(npa, cv_tokens) if cv_tokens else []
+        cover_matches = collect_evidence_matches(npa, cover_tokens) if cover_tokens else []
+        cv_persona_matches = collect_text_matches(winning_persona_evidence, cv_tokens, clean_targets=False) if cv_tokens else []
+        cover_persona_matches = collect_text_matches(winning_persona_evidence, cover_tokens, clean_targets=False) if cover_tokens else []
+
+        print("CV MATCHES FOUND:", len(cv_matches))
+        print("COVER MATCHES FOUND:", len(cover_matches))
+        print("CV PERSONA MATCHES FOUND:", len(cv_persona_matches))
+        print("COVER PERSONA MATCHES FOUND:", len(cover_persona_matches))
+
+        words = []
+        for value in [
+            npa.name,
+            *(npa.bachelor_gpa or []),
+            *(npa.bachelor_education or []),
+            *(npa.master_gpa or []),
+            *(npa.master_education or []),
+            *(npa.international_experience or []),
+            *(npa.exchange_education or []),
+            *(npa.student_job or []),
+
+        ]:
+            if value:
+                words += [w.strip(" ,.;:()[]{}") for w in str(value).split() if len(w.strip(" ,.;:()[]{}")) > 2]
+
+        words = list(set(words))
+
+        if cv_pdf_path and (cv_matches or cv_persona_matches):
+            highlighted_cv_url = make_highlighted_pdf(cv_pdf_path, cv_matches, cv_persona_matches)
+            cv_viewer.props(f'src={highlighted_cv_url}')
+
+        elif cv_pdf_path and words:
+            highlighted_cv_url = make_highlighted_pdf_ocr(cv_pdf_path, words)
+            cv_viewer.props(f'src={highlighted_cv_url}')
+
+        if cover_pdf_path and (cover_matches or cover_persona_matches):
+            highlighted_cover_url = make_highlighted_pdf(cover_pdf_path, cover_matches, cover_persona_matches)
+            cover_viewer.props(f'src={highlighted_cover_url}')
+        elif cover_pdf_path and words:
+            highlighted_cover_url = make_highlighted_pdf_ocr(cover_pdf_path, words)
+            cover_viewer.props(f'src={highlighted_cover_url}')
+
+    except Exception as e:
+        print("ERROR:", e)
+        output_area.value = str(e)
+
+    finally:
+        progress.visible = False
+        progress.value = 0
+
+progress = ui.linear_progress(value=0).classes('w-full')
+label = ui.label('0%')
+
+progress.visible = False
+label.visible = False
+
+ui.button("Extract", on_click=send_input)
+
+
+def get_column_split(page):
+    words = page.extract_words()
+    if len(words) < 20:
+        return None
+
+    centers = sorted((w["x0"] + w["x1"]) / 2 for w in words)
+    gaps = [(centers[i+1] - centers[i], centers[i], centers[i+1]) for i in range(len(centers)-1)]
+    if not gaps:
+        return None
+
+    biggest_gap, left_edge, right_edge = max(gaps, key=lambda x: x[0])
+    split = (left_edge + right_edge) / 2
+
+    # Kun acceptér split hvis det ligner en reel midter-gutter
+    if (
+        biggest_gap > page.width * 0.12
+        and page.width * 0.3 < split < page.width * 0.7
+    ):
+        left_count = sum(1 for c in centers if c < split)
+        right_count = sum(1 for c in centers if c >= split)
+
+        if left_count > len(centers) * 0.2 and right_count > len(centers) * 0.2:
+            return split
+
+    return None
+
+
+def extract_page_text(page):
+    split = get_column_split(page)
+
+    if split is None:
+        return page.extract_text() or ''
+
+    left_text = page.crop((0, 0, split, page.height)).extract_text() or ''
+    right_text = page.crop((split, 0, page.width, page.height)).extract_text() or ''
+
+    return left_text + '\n' + right_text
+
+#Upload pdf file to Nice Gui
+def extract_text_from_pdf_bytes(pdf_bytes):
+    text = ''
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text(x_tolerance=2, y_tolerance=3) or ''
+
+            if not page_text.strip():
+                page_text = page.extract_text() or ''
+
+            text += page_text + '\n'
+
+    if not text.strip():
+        print("Falling back to OCR (pytesseract)...")
+        images = convert_from_bytes(pdf_bytes)
+        text = ''
+
+        for img in images:
+            text += pytesseract.image_to_string(img) + '\n'
+    else:
+        print("Used pdfplumber (text-based PDF)")
+
+    return text
+
+markdown = ui.markdown('Choose a PDF file!')
+
+async def upload_cv(e: events.UploadEventArguments):
+    global cv_pdf_path, cv_tokens, cv_raw_text
+
+    pdf_bytes = await e.file.read()
+    safe_name = (e.file.name or "cv.pdf").replace(" ", "_")
+    filename = f'{uuid.uuid4().hex}_{safe_name}'
+    cv_pdf_path = os.path.join(PDF_DIR, filename)
+
+    with open(cv_pdf_path, 'wb') as f:
+        f.write(pdf_bytes)
+
+    cv_viewer.props(f'src=/pdfs/{filename}')
+    cv_viewer.update()
+
+    cv_raw_text = extract_text_from_pdf_bytes(pdf_bytes)
+    cv_tokens = extract_word_tokens(pdf_bytes)
+
+async def upload_cover(e: events.UploadEventArguments):
+    global cover_pdf_path, cover_tokens, cover_raw_text
+
+    print('upload_cover fired')
+
+    pdf_bytes = await e.file.read()
+    safe_name = (e.file.name or "cover.pdf").replace(" ", "_")
+    filename = f'{uuid.uuid4().hex}_{safe_name}'
+    cover_pdf_path = os.path.join(PDF_DIR, filename)
+
+    with open(cover_pdf_path, 'wb') as f:
+        f.write(pdf_bytes)
+
+    print('cover filename:', filename)
+    print('cover path:', cover_pdf_path)
+
+    cover_viewer.props(f'src=/pdfs/{filename}')
+    cover_viewer.update()
+
+    cover_raw_text = extract_text_from_pdf_bytes(pdf_bytes)
+    cover_tokens = extract_word_tokens(pdf_bytes)
+
+ui.label('Upload CV')
+ui.upload(on_upload=upload_cv, auto_upload=True).props('accept=.pdf')
+
+ui.label('Upload Cover Letter')
+ui.upload(on_upload=upload_cover, auto_upload=True).props('accept=.pdf')
+
+with ui.row().classes('w-full'):
+    cv_viewer = ui.element('iframe').classes('w-1/2').style('height:900px; border:none;')
+    cover_viewer = ui.element('iframe').classes('w-1/2').style('height:900px; border:none;')
+
+#Add second area for highlighting nice gui
+# create UI element
+highlighted_output = ui.html().classes('w-full')
+
+def make_highlighted_pdf(src_path, candidate_matches, persona_matches=None):
+    doc = fitz.open(src_path)
+    persona_matches = persona_matches or []
+
+    for matches, color in [
+        (candidate_matches, (1, 1, 0)),
+        (persona_matches, (0.53, 0.81, 1)),
+    ]:
+        for m in matches:
+            for token in m["tokens"]:
+                page = doc[token["page"]]
+                rect = fitz.Rect(token["x0"], token["top"], token["x1"], token["bottom"])
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=color)
+                annot.update(opacity=0.35)
+
+    out = f'/tmp/nicegui_pdfs/h_{uuid.uuid4().hex}.pdf'
+    doc.save(out)
+    doc.close()
+    return out.replace('/tmp/nicegui_pdfs', '/pdfs')
+
+#Highlight pdf'er scannet som billeder
+def make_highlighted_pdf_ocr(src_path, target_words):
+    doc = fitz.open(src_path)
+    images = convert_from_path(src_path)
+
+    target_words_norm = [norm(w) for w in target_words]
+
+    for page_num, img in enumerate(images):
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        page = doc[page_num]
+        pw, ph = page.rect.width, page.rect.height
+
+        for i, text in enumerate(data["text"]):
+            word = text.strip()
+            if not word:
+                continue
+        
+            if norm(word) in target_words_norm:
+                x0 = data["left"][i] * pw / img.width
+                y0 = data["top"][i] * ph / img.height
+                x1 = (data["left"][i] + data["width"][i]) * pw / img.width
+                y1 = (data["top"][i] + data["height"][i]) * ph / img.height
+                page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
+        
+    out_name = f'highlighted_{uuid.uuid4().hex}.pdf'
+    out_path = os.path.join(PDF_DIR, out_name)
+    doc.save(out_path, garbage=4, deflate=True)
+    doc.close()
+    return f'/pdfs/{out_name}'
+
+#Gem til Excel
+def save_to_excel():
+    if not all_candidates: ui.notify('No data'); return
+
+    path = '/Users/danicahennelly/Speciale UDENFOR iCloud/TEST.xlsx'
+    wb = load_workbook(path) if os.path.exists(path) else Workbook()
+
+    if "Candidates" in wb.sheetnames:
+        ws = wb["Candidates"]
+    else:
+        active = wb.active
+        if wb.sheetnames == [active.title] and active.max_row == 1 and all(cell.value is None for cell in active[1]):
+            ws = active
+            ws.title = "Candidates"
+        else:
+            ws = wb.create_sheet(title="Candidates")
+
+    if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
+        for index, header in enumerate(EXCEL_HEADERS, start=1):
+            ws.cell(row=1, column=index, value=header)
+    elif ws.max_row == 1 and [cell.value for cell in ws[1]] != EXCEL_HEADERS:
+        ws.insert_rows(1)
+        for index, header in enumerate(EXCEL_HEADERS, start=1):
+            ws.cell(row=1, column=index, value=header)
+
+    for row in all_candidates:
+        ws.append([row.get(header, "") for header in EXCEL_HEADERS])
+
+    wb.save(path); ui.notify(f'Saved {len(all_candidates)}'); all_candidates.clear()
+
+def set_background(color: str = '#000000'):
+    ui.query('body').style(f'background-color: {color}') 
+
+set_background('#000000')
+
+ui.button("Save to Excel", on_click=save_to_excel)
+
+ui.run()
